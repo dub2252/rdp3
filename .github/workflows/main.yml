@@ -1,0 +1,148 @@
+name: RDP - Print Password (secret masked)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Optionally disable NLA (better security if enabled, only disable if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Ensure firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create or Update RDP User
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if (-not $username -or $username.Trim().Length -eq 0) {
+            Write-Error "RDP_USERNAME missing"
+            exit 1
+          }
+          if (-not $password -or $password.Trim().Length -eq 0) {
+            Write-Error "RDP_PASSWORD missing"
+            exit 1
+          }
+          if ($username -eq '***' -or $password -eq '***') {
+            Write-Error "Mask detected - use valid secrets"
+            exit 1
+          }
+          if ($password.Length -lt 8) {
+            Write-Warning "Password under 8 chars; Windows may reject weak passwords."
+          }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false
+            Write-Host "Created user: $username"
+          } else {
+            Set-LocalUser -Name $username -Password $securePass
+            Write-Host "Updated password for: $username"
+          }
+
+          if (-not (Get-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue)) {
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          }
+          if (-not (Get-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue)) {
+            Add-LocalGroupMember -Group "Administrators" -Member $username
+          }
+
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Install Comet Browser
+        shell: pwsh
+        run: |
+          # Download latest Comet installer (URL may change for new releases)
+          $cometUrl = "https://www.perplexity.ai/rest/browser/binaries/windows-installers/18329/comet_installer_latest.exe?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=9d06dad57704bf499ceb71a8730b22e4%2F20251017%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20251017T120302Z&X-Amz-Expires=300&X-Amz-Signature=89c13bad2834b3f3611ef7e3b92a6819ba06ead35c4221cf7c7f48e9c8d3c25f&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject"
+          $cometPath = "$env:TEMP\comet_installer_latest.exe"
+          Invoke-WebRequest -Uri $cometUrl -OutFile $cometPath
+          Start-Process -FilePath $cometPath -ArgumentList "/silent" -Wait
+          Remove-Item $cometPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY.Trim().Length -eq 0) {
+            Write-Error "TAILSCALE_AUTH_KEY missing"
+            exit 1
+          }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+            $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-String -Pattern '\d+\.\d+\.\d+\.\d+' -AllMatches).Matches.Value -join ','
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IP found."
+            exit 1
+          }
+          $firstIP = $tsIP.Split(',')[0].Trim()
+          echo "TAILSCALE_IP=$firstIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $firstIP"
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Testing RDP to $env:TAILSCALE_IP"
+          if (-not $env:TAILSCALE_IP) {
+            Write-Error "No Tailscale IP for test."
+            exit 1
+          }
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Detailed
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 unreachable. Details:`n$($testResult | Out-String)"
+            exit 1
+          }
+          Write-Host "RDP port 3389 reachable."
+
+      - name: Maintain Connection (prints password; secret-sourced value will likely be masked)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
